@@ -3,8 +3,7 @@
 // ─── 配置 ───────────────────────────────────────────────────────────────────
 
 const PREFIX = '/';
-const BLOCKED_UA = ['netcraft'];
-const WHITE_LIST = []; // 非空时仅允许路径包含白名单字符（直连加速 + /raw/ 均生效）
+const DEFAULT_BLOCKED_UA = ['netcraft'];
 const SPEEDTEST_MAX_BYTES = 100_000_000;
 const MAX_REDIRECT_DEPTH = 5;
 
@@ -20,7 +19,7 @@ const GH_PATTERNS = {
 const CORS = {
     'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS',
-    'access-control-allow-headers': 'Content-Type, Authorization',
+    'access-control-allow-headers': 'Content-Type, Authorization, X-OpenRouter-Key',
     'access-control-expose-headers': '*',
     'access-control-max-age': '1728000',
 };
@@ -94,14 +93,15 @@ function resolveHome(env) {
     return { type: 'proxy', target: home };
 }
 
-function parseExtraUA(env) {
-    return parseEnvList(env.UA);
+/** 合并默认与自定义拦截 UA */
+function getBlockedUA(env) {
+    const extra = parseEnvList(env.UA);
+    return [...DEFAULT_BLOCKED_UA, ...extra];
 }
 
-function isBlockedUA(request, env) {
-    const list = [...BLOCKED_UA, ...parseExtraUA(env)];
+function isBlockedUA(request, blockedUA) {
     const ua = (request.headers.get('User-Agent') || '').toLowerCase();
-    return list.length > 0 && list.some((k) => ua.includes(k));
+    return blockedUA.length > 0 && blockedUA.some((k) => ua.includes(k));
 }
 
 /** GitHub REST API 路由：/github/ 但不匹配 /github.com/ */
@@ -130,7 +130,7 @@ function authInvalidErr() {
     return err('AUTH_TOKEN 无效', 403);
 }
 
-/** 时序安全的密钥比较（客户端 token 永不转发给 GitHub） */
+/** 时序安全的密钥比较 */
 async function secureCompare(provided, expected) {
     const enc = new TextEncoder();
     const a = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(provided || '')));
@@ -148,7 +148,6 @@ async function validateToken(request, url, env) {
     return valid ? { ok: true } : { ok: false, missing: false };
 }
 
-/** AUTH_TOKEN 已配置时，可选公开接口需 PUBLIC 才免鉴权 */
 async function requireAuthUnlessPublic(request, url, env, endpoint) {
     if (isPublicEndpoint(env, endpoint)) return null;
     const r = await validateToken(request, url, env);
@@ -156,9 +155,11 @@ async function requireAuthUnlessPublic(request, url, env, endpoint) {
     return r.missing ? authRequiredErr() : authInvalidErr();
 }
 
-function checkWhiteList(urlStr) {
-    if (!WHITE_LIST.length) return true;
-    return WHITE_LIST.some((w) => urlStr.includes(w));
+/** 白名单检查：从 env.WHITE_LIST 读取，支持逗号分隔 */
+function checkWhiteList(urlStr, env) {
+    const list = parseEnvList(env.WHITE_LIST);
+    if (!list.length) return true;
+    return list.some((w) => urlStr.includes(w));
 }
 
 function buildHeaders(request, env) {
@@ -182,8 +183,8 @@ async function proxyGitHub(targetUrl, reqInit, workerOrigin, depth = 0) {
         if (checkGitHubUrl(loc)) {
             headers.set('location', workerOrigin + PREFIX + loc.replace(/^https?:\/\//, ''));
         } else if (loc.startsWith('http')) {
-            reqInit.redirect = 'follow';
-            return proxyGitHub(loc, reqInit, workerOrigin, depth + 1);
+            const newInit = { ...reqInit, redirect: 'manual' }; // 避免修改原对象
+            return proxyGitHub(loc, newInit, workerOrigin, depth + 1);
         }
     }
 
@@ -200,8 +201,9 @@ function httpHandler(request, pathname, workerOrigin, env = {}) {
         return preflight();
     }
 
-    let urlStr = pathname;
-    if (!checkWhiteList(urlStr)) return err('路径不在白名单', 403);
+    // 去掉前导斜杠再检查白名单
+    let urlStr = pathname.replace(/^\/+/, '');
+    if (!checkWhiteList(urlStr, env)) return err('路径不在白名单', 403);
     if (!/^https?:\/\//i.test(urlStr)) urlStr = 'https://' + urlStr;
 
     return proxyGitHub(urlStr, {
@@ -243,7 +245,7 @@ function buildMyRawUrl(env, subPath) {
     return base + (subPath.startsWith('/') ? subPath : `/${subPath}`);
 }
 
-/** myRaw 鉴权：校验客户端 AUTH_TOKEN，GitHub 请求固定使用 GH_TOKEN */
+/** myRaw 鉴权 */
 async function authorizeMyRaw(request, url, env, subPath) {
     if (!env.GH_TOKEN) return { ok: false, response: err('服务未配置 GH_TOKEN', 500) };
 
@@ -349,7 +351,7 @@ footer{text-align:center;opacity:.4;font-size:.75rem;padding:1rem 0}
 <body>
 <div class="wrap">
 <h1>边缘代理工具箱</h1>
-<p class="sub">GitHub 文件加速 · API 代理 · 存储 · 测速</p>
+<p class="sub">GitHub 文件加速 · API 代理 · 存储 · 测速 · OpenRouter</p>
 <form class="search" onsubmit="return go(event)">
 <input name="q" placeholder="粘贴 GitHub 完整链接（支持 https://），如 https://github.com/user/repo/archive/main.zip">
 <button type="submit">→</button>
@@ -420,6 +422,9 @@ footer{text-align:center;opacity:.4;font-size:.75rem;padding:1rem 0}
 <code>GET ${origin}/storage?filename=a.yaml</code></div>
 <div class="ep"><strong>GET /speedtest?bytes=</strong> — 下载测速<span class="tag">公开</span>
 <code>GET ${origin}/speedtest?bytes=20000000</code></div>
+<div class="ep"><strong>ANY /openrouter/{path}</strong> — OpenRouter API 代理<span class="tag">客户端自带 Key</span>
+<code>POST ${origin}/openrouter/chat/completions</code>
+<code>Authorization: Bearer YOUR_OPENROUTER_KEY</code></div>
 <div class="ep"><strong>GET /health</strong> — 健康检查<span class="tag">公开</span>
 <code>GET ${origin}/health</code></div>
 <dl class="auth-box">
@@ -436,7 +441,10 @@ gstatic:location.protocol==='https:'?'https://www.gstatic.com/generate_204':'htt
 cloudflare:'https://cp.cloudflare.com/generate_204'
 };
 function go(e){e.preventDefault();const q=document.querySelector('[name=q]').value.trim();if(!q)return false;
-const base=location.origin+'/';window.open(base+q.replace(/^https?:\\/\\//,''),'_blank');return false}
+let targetUrl = q;
+if (!/^https?:\\/\\//i.test(targetUrl)) targetUrl = 'https://' + targetUrl;
+window.open(location.origin + '/' + targetUrl.replace(/^https?:\\/\\//,''),'_blank');
+return false}
 function copyBase(btn){const t=document.getElementById('base-url').textContent;
 navigator.clipboard.writeText(t).then(()=>{btn.textContent='已复制';setTimeout(()=>btn.textContent='复制基址',1500)})}
 async function pingOnce(target){
@@ -513,7 +521,7 @@ const apiHandlers = {
         try {
             const path = url.pathname.replace(/^\/github\//, '');
             const params = new URLSearchParams(url.search);
-            params.delete('token'); // 鉴权参数不转发给 GitHub API
+            params.delete('token');
             const qs = params.toString();
             const target = `https://api.github.com/${path}${qs ? '?' + qs : ''}`;
             const body = ['GET', 'HEAD'].includes(request.method) ? undefined : await request.text();
@@ -578,12 +586,12 @@ const apiHandlers = {
         }
     },
 
-    /** 公开 Raw 短路径代理（完整 GitHub URL 请用直连加速） */
+    /** 公开 Raw 短路径代理 */
     async raw(request, url, env) {
         if (request.method !== 'GET') return err('不支持的请求方法', 405);
         const inputPath = url.pathname.replace(/^\/raw\/?/, '');
         if (!inputPath) return err('请提供 GitHub 路径', 400);
-        if (!checkWhiteList(inputPath)) return err('路径不在白名单', 403);
+        if (!checkWhiteList(inputPath, env)) return err('路径不在白名单', 403);
 
         const p = inputPath.startsWith('/') ? inputPath : `/${inputPath}`;
         const target = (p.includes('/releases/download/') || p.includes('/archive/'))
@@ -595,7 +603,7 @@ const apiHandlers = {
         return proxyGitHub(target, { method: 'GET', headers: buildHeaders(request, env), redirect: 'manual' }, url.origin);
     },
 
-    /** 私有库 Raw：GH_REPO 绑定仓库，GH_TOKEN 仅用于服务端请求 */
+    /** 私有库 Raw */
     async myRaw(request, url, env) {
         if (request.method !== 'GET' && request.method !== 'HEAD') return err('不支持的请求方法', 405);
 
@@ -603,7 +611,6 @@ const apiHandlers = {
         if (!subPath) return err('请提供文件路径', 400);
         if (!subPath.startsWith('/')) subPath = '/' + subPath;
 
-        // 禁止通过完整 raw 域名绕过仓库绑定
         if (/raw\.githubusercontent\.com/i.test(subPath)) {
             return err('请使用短路径，如 /myRaw/config.yaml', 400);
         }
@@ -630,6 +637,53 @@ const apiHandlers = {
         }
     },
 
+    /** OpenRouter API 代理（使用客户端 Key） */
+    async openrouter(request, url, env) {
+        const path = url.pathname.replace(/^\/openrouter\/?/, '');
+        if (!path) return err('请提供 OpenRouter API 路径', 400);
+
+        // 支持两种路径格式：/openrouter/chat/completions 或 /openrouter/api/v1/chat/completions
+        let apiPath = path;
+        if (!apiPath.startsWith('api/')) {
+            apiPath = 'api/v1/' + apiPath;
+        }
+        const target = `https://openrouter.ai/${apiPath}${url.search}`;
+
+        // 获取客户端提供的 OpenRouter API Key
+        // 优先从独立 Header 获取，若没有则从 Authorization 获取（兼容 Agent 工具的常见配置）
+        const clientKey = request.headers.get('X-OpenRouter-Key')
+            || request.headers.get('Authorization')?.replace(/^Bearer\s+/i, '');
+
+        // 如果没有客户端 Key，则尝试使用服务端配置的 Key（可选兜底）
+        const finalKey = clientKey || env.OPENROUTER_API_KEY;
+
+        if (!finalKey) {
+            return err('请提供 OpenRouter API Key（Header: Authorization: Bearer <key> 或 X-OpenRouter-Key）', 401);
+        }
+
+        // 构建转发请求头
+        const headers = new Headers(request.headers);
+        headers.set('Authorization', `Bearer ${finalKey}`);
+        if (env.OPENROUTER_REFERER) headers.set('HTTP-Referer', env.OPENROUTER_REFERER);
+        if (env.OPENROUTER_TITLE) headers.set('X-Title', env.OPENROUTER_TITLE);
+        headers.delete('host');
+        headers.delete('x-forwarded-for');
+        headers.delete('x-real-ip');
+
+        try {
+            const res = await fetch(target, {
+                method: request.method,
+                headers,
+                body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
+                redirect: 'follow'
+            });
+            const h = applyCors(new Headers(res.headers));
+            return new Response(res.body, { status: res.status, headers: h });
+        } catch (e) {
+            return err('OpenRouter 请求失败: ' + e.message);
+        }
+    },
+
     health() {
         return json({ status: 'ok' });
     },
@@ -645,7 +699,9 @@ export default {
 
             if (request.method === 'OPTIONS') return preflight();
 
-            if (isBlockedUA(request, env)) return text(nginxPage(), 200, 'text/html');
+            // 合并默认与自定义拦截 UA（缓存到局部变量）
+            const blockedUA = getBlockedUA(env);
+            if (isBlockedUA(request, blockedUA)) return text(nginxPage(), 200, 'text/html');
 
             const q = url.searchParams.get('q');
             if (q) {
@@ -660,6 +716,7 @@ export default {
             if (pathname === '/speedtest') return apiHandlers.speedtest(request, url, env);
             if (isRawApiRoute(pathname)) return apiHandlers.raw(request, url, env);
             if (pathname === '/myRaw' || pathname.startsWith('/myRaw/')) return apiHandlers.myRaw(request, url, env);
+            if (pathname === '/openrouter' || pathname.startsWith('/openrouter/')) return apiHandlers.openrouter(request, url, env);
 
             if (pathname === '/' || pathname === '') {
                 const home = resolveHome(env);
